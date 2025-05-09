@@ -24,18 +24,13 @@
 
 <a id="introduction"></a>  
 ## 🧭 Introduction  
-Bitnami’s SealedSecrets enables secure GitOps by encrypting Kubernetes secrets with asymmetric keys. However, **key rotation** leaves older secrets vulnerable until manually re-encrypted. This proposal automates re-encryption via a new `kubeseal reencrypt` command, ensuring all secrets use the latest key without manual intervention.
+Bitnami’s [SealedSecrets](https://github.com/bitnami-labs/sealed-secrets) encrypts Kubernetes secrets using asymmetric keys, but manual re-encryption during key rotation creates operational overhead. This proposal automates the process via a new `kubeseal reencrypt` command, ensuring all secrets use the latest key without compromising security.
 
 ---
 
 <a id="implementation-overview"></a>  
 ## 🔧 Implementation Overview  
 ### High-Level Workflow  
-1. **Discover**: Fetch all `SealedSecrets` in the cluster/namespace.  
-2. **Decrypt**: Unseal secrets using historical private keys.  
-3. **Re-encrypt**: Seal secrets with the latest public key.  
-4. **Update**: Apply the re-encrypted `SealedSecrets` back to the cluster.  
-
 ```mermaid  
 graph TD  
   A[ClusterScanner] -->|List SealedSecrets| B[Decryptor]  
@@ -49,168 +44,175 @@ graph TD
 <a id="component-breakdown"></a>  
 ## 🔍 Component Breakdown  
 
-<a id="1-clusterscanner"></a>  
 ### 1. ClusterScanner  
 **Purpose**: Fetch all `SealedSecrets` from the Kubernetes API.  
-**Reused Code**: Leverages the controller’s `client.List` method ([ref](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/client/client.go)).  
 
-```go  
-// Input: Kubernetes client and target namespace (empty for cluster-wide).  
-// Output: Slice of SealedSecrets or error.  
-func ListSealedSecrets(client client.Client, namespace string) ([]v1beta1.SealedSecret, error) {  
-    opts := []client.ListOption{client.InNamespace(namespace)}  
-    var sealedSecrets v1beta1.SealedSecretList  
-    err := client.List(context.Background(), &sealedSecrets, opts...)  
-    return sealedSecrets.Items, err  
-}  
-```  
+```diff
+# Reuses client.List from sealed-secrets/pkg/client/client.go
++ func ListSealedSecrets(client client.Client, namespace string) ([]v1beta1.SealedSecret, error) {
++     opts := []client.ListOption{
++         client.InNamespace(namespace),
++         client.MatchingLabels{"sealedsecrets.bitnami.com/key-rotation": "true"},
++     }
++     var sealedSecrets v1beta1.SealedSecretList
++     err := client.List(context.Background(), &sealedSecrets, opts...)
++     return sealedSecrets.Items, err
++ }
+```
 
 ---
 
-<a id="2-keymanager"></a>  
 ### 2. KeyManager  
-**Purpose**: Load private/public keys from the cluster.  
-**Security**: Keys are fetched from the `sealed-secrets-key` Secret and zeroized after use.  
+**Purpose**: Load and manage private/public keys securely.  
 
-```go  
-// Input: Kubernetes Secret containing keys.  
-// Output: Map of private keys + latest public key.  
-func LoadKeys(keySecret *v1.Secret) (map[string]*rsa.PrivateKey, *rsa.PublicKey, error) {  
-    privateKeys := parsePrivateKeys(keySecret.Data["tls.key"])  
-    latestPubKey := parsePublicKey(keySecret.Data["tls.crt"])  
-    return privateKeys, latestPubKey, nil  
-}  
-```  
-
-**Key Rotation Handling**:  
-- Uses `sealed-secrets-controller`’s key-labeling system ([ref](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/apis/sealed-secrets/v1alpha1/sealedsecret.go#L29)).  
+```diff
+# Extends parseKeyPair() from sealed-secrets/pkg/crypto/crypto.go#L89
++ func LoadKeys(keySecret *v1.Secret) (map[string]*rsa.PrivateKey, *rsa.PublicKey, error) {
++     privateKeys := make(map[string]*rsa.PrivateKey)
++     for label, keyBytes := range keySecret.Data {
++         if key, err := parseKeyPair(keyBytes); err == nil {
++             privateKeys[label] = key.PrivateKey
++         }
++     }
++     latestPubKey := getLatestPublicKey(keySecret.Data["tls.crt"])
++     return privateKeys, latestPubKey, nil
++ }
+```
 
 ---
 
-<a id="3-decryptor"></a>  
 ### 3. Decryptor  
 **Purpose**: Decrypt secrets using historical private keys.  
-**Reused Code**: Calls `UnsealSecret` from `crypto.go` ([ref](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/crypto/crypto.go#L123)).  
 
-```go  
-// Input: SealedSecret + private key.  
-// Output: Decrypted Kubernetes Secret or error.  
-func DecryptSealedSecret(ss v1beta1.SealedSecret, privateKey *rsa.PrivateKey) (*v1.Secret, error) {  
-    return crypto.UnsealSecret(ss.Spec.EncryptedData, privateKey)  
-}  
-```  
+```diff
+# Directly uses UnsealSecret from sealed-secrets/pkg/crypto/crypto.go#L123
++ func DecryptSealedSecret(ss v1beta1.SealedSecret, privateKey *rsa.PrivateKey) (*v1.Secret, error) {
++     secret := &v1.Secret{
++         ObjectMeta: metav1.ObjectMeta{Name: ss.Name, Namespace: ss.Namespace},
++     }
++     if err := crypto.UnsealSecret(ss.Spec.EncryptedData, secret, privateKey); err != nil {
++         return nil, fmt.Errorf("decryption failed for %s/%s: %w", ss.Namespace, ss.Name, err)
++     }
++     return secret, nil
++ }
+```
 
 ---
 
-<a id="4-reencryptor"></a>  
 ### 4. ReEncryptor  
 **Purpose**: Re-encrypt secrets with the latest public key.  
-**Reused Code**: Uses `Seal` from `client.go` ([ref](https://github.com/bitnami-labs/sealed-secrets/blob/main/cmd/kubeseal/client.go#L150)).  
 
-```go  
-// Input: Decrypted Secret + latest public key.  
-// Output: New SealedSecret or error.  
-func ReEncryptSecret(secret *v1.Secret, pubKey *rsa.PublicKey) (*v1beta1.SealedSecret, error) {  
-    return kubeseal.Seal(secret, pubKey, v1beta1.SchemeGroupVersion)  
-}  
-```  
+```diff
+# Wraps Seal() from sealed-secrets/cmd/kubeseal/client.go#L150
++ func ReEncryptSecret(secret *v1.Secret, pubKey *rsa.PublicKey) (*v1beta1.SealedSecret, error) {
++     sealed := &v1beta1.SealedSecret{
++         ObjectMeta: metav1.ObjectMeta{Name: secret.Name, Namespace: secret.Namespace},
++     }
++     if err := kubeseal.Seal(secret, pubKey, sealed, v1beta1.SchemeGroupVersion); err != nil {
++         return nil, fmt.Errorf("re-encryption failed: %w", err)
++     }
++     return sealed, nil
++ }
+```
 
 ---
 
-<a id="5-updater"></a>  
 ### 5. Updater  
 **Purpose**: Apply re-encrypted secrets back to the cluster.  
 
-```go  
-// Input: Kubernetes client + updated SealedSecret.  
-// Output: Error if update fails.  
-func UpdateSealedSecret(client client.Client, updated *v1beta1.SealedSecret) error {  
-    return client.Update(context.Background(), updated)  
-}  
-```  
+```go
+func UpdateSealedSecret(client client.Client, updated *v1beta1.SealedSecret) error {
+    return client.Update(context.Background(), updated)
+}
+```
 
 ---
 
-<a id="6-logger-bonus"></a>  
 ### 6. Logger (Bonus)  
-**Purpose**: Track progress and failures.  
+**Purpose**: Track progress with structured logs.  
 
-```go  
-// Log Format (JSON):  
-{  
-  "success": bool,  
-  "name": "secret-name",  
-  "namespace": "default",  
-  "error": "..."  
-}  
-```  
+```diff
++ // Log Format (JSON):
++ {
++   "timestamp": "RFC3339",
++   "name": "secret-name",
++   "namespace": "default",
++   "oldKey": "key-label-2023",
++   "newKey": "key-label-2024",
++   "error": ""
++ }
+```
 
 ---
 
 <a id="security--scalability"></a>  
 ## 🛡 Security & ⚡ Scalability  
 
-### Security Measures  
-- **Private Key Handling**:  
-  - Keys are loaded only during re-encryption and zeroized using `memset_s` ([CWE-14](https://cwe.mitre.org/data/definitions/14.html)).  
-- **RBAC**: Minimal permissions required:  
-  ```yaml  
-  - apiGroups: ["bitnami.com"]  
-    resources: ["sealedsecrets"]  
-    verbs: ["get", "list", "update"]  
-  ```  
+### Security  
+```diff
+# Critical: Zeroize keys after use (CWE-14 mitigation)
++ func zeroizeKeys(privateKeys map[string]*rsa.PrivateKey) {
++     for _, key := range privateKeys {
++         runtime.SetFinalizer(key, func(k *rsa.PrivateKey) {
++             memset_s(unsafe.Pointer(k), 0, unsafe.Sizeof(*k))
++         })
++     }
++ }
+```
 
 ### Scalability  
-- **Concurrency**: Process secrets in parallel (10 goroutines by default).  
-- **Batching**: Use `ListOptions.Limit` for large clusters.  
+- **Batching**: Uses `ListOptions.Limit=500` for large clusters.  
+- **Concurrency**: Processes secrets in parallel (10 goroutines).  
 
 ---
 
 <a id="cli-integration"></a>  
 ## 🖥 CLI Integration  
-New `reencrypt` command:  
-
-Add a new command to `kubeseal`:
-
 ```diff
- func main() {
-     ...
-+    reencrypt := app.Command("reencrypt", "Re-encrypt all SealedSecrets with the latest public key")
-+    reencryptNamespace := reencrypt.Flag("namespace", "Target namespace").Default("").String()
-
-     switch kingpin.MustParse(app.Parse(os.Args[1:])) {
-+    case reencrypt.FullCommand():
-+        return runReencrypt(*reencryptNamespace)
-     }
- }
+# Diff for cmd/kubeseal/main.go
+  func main() {
+      app := kingpin.New("kubeseal", "Tool for sealing Kubernetes secrets.")
++     reencrypt := app.Command("reencrypt", "Re-encrypt all SealedSecrets with the latest key")
++     reencrypt.Flag("namespace", "Target namespace").String()
++     reencrypt.Flag("dry-run", "Preview changes").Bool()
+  
+      switch kingpin.MustParse(app.Parse(os.Args[1:])) {
++     case reencrypt.FullCommand():
++         runReencrypt(*reencryptNamespace, *dryRun)
+      }
+  }
 ```
-
-**Flags**:  
-- `--namespace`: Target namespace (default: all).  
-- `--resume-from`: Resume from a specific secret (handles interruptions).  
 
 ---
 
 <a id="testing--validation"></a>  
 ## 🧪 Testing & Validation  
-| Test Case                  | Method                          |  
-|----------------------------|---------------------------------|  
-| Key Rotation               | Mock controller with old/new keys |  
-| Partial Failures           | Inject API errors               |  
-| Large Cluster              | 1k+ secrets in `kind` cluster  |  
+| Test Case                | Method                                  |  
+|--------------------------|-----------------------------------------|  
+| Key Rotation             | Mock controller with 3 key generations  |  
+| RBAC Failure             | Deny `update` permissions               |  
+| Large Cluster            | 5k secrets in `kind` cluster            |  
 
 ---
 
 <a id="usage-examples"></a>  
 ## 📦 Usage Examples  
-**Dry Run**:  
-```bash  
-kubeseal reencrypt --namespace=dev --dry-run  
-```  
+```bash
+kubeseal reencrypt \
+  --namespace=prod \
+  --dry-run \
+  --log-file=audit.json
+```
+
 **Output**:  
-```  
-Re-encrypted 50/50 secrets (dry run).  
-```  
+```json
+{
+  "timestamp": "2025-05-10T12:34:56Z",
+  "reencrypted": 142,
+  "failed": 2,
+  "errors": ["default/mysql-token: decryption failed"]
+}
+```
 
 ---
 
@@ -218,13 +220,14 @@ Re-encrypted 50/50 secrets (dry run).
 ## ⚠ Challenges & Mitigations  
 | Challenge                | Mitigation                              |  
 |--------------------------|-----------------------------------------|  
-| Key Exposure             | Memory-only handling + RBAC             |  
-| Legacy Secrets           | Skip and log warnings                  |  
-| API Throttling           | Exponential backoff retries            |  
+| Key Exposure             | Memory-only handling + zeroization      |  
+| Partial Failures         | Atomic updates + resume flag            |  
+| Legacy Secrets           | Skip with warning logs                  |  
 
 ---
 
 <a id="references"></a>  
 ## 📚 References  
-- [SealedSecrets Crypto Logic](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/crypto/crypto.go)  
-- [Kubeseal CLI](https://github.com/bitnami-labs/sealed-secrets/blob/main/cmd/kubeseal/client.go)  
+- [Original `UnsealSecret`](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/crypto/crypto.go#L123)  
+- [Key Rotation Logic](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/controller/controller.go#L421)  
+- [Kubernetes RBAC Guide](https://kubernetes.io/docs/reference/access-authn-authz/rbac/)  
