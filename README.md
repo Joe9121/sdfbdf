@@ -220,5 +220,3 @@ Re-encrypted 50/50 secrets (dry run).
 ## 📚 References  
 - [SealedSecrets Crypto Logic](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/crypto/crypto.go)  
 - [Kubeseal CLI](https://github.com/bitnami-labs/sealed-secrets/blob/main/cmd/kubeseal/client.go)  
-```  
-
