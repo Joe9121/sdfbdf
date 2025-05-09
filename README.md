@@ -170,12 +170,20 @@ func UpdateSealedSecret(client client.Client, updated *v1beta1.SealedSecret) err
 ## 🖥 CLI Integration  
 New `reencrypt` command:  
 
-```bash  
-kubeseal reencrypt \  
-  --namespace=prod \  
-  --dry-run \  
-  --log-file=report.json  
-```  
+Add a new command to `kubeseal`:
+
+```diff
+ func main() {
+     ...
++    reencrypt := app.Command("reencrypt", "Re-encrypt all SealedSecrets with the latest public key")
++    reencryptNamespace := reencrypt.Flag("namespace", "Target namespace").Default("").String()
+
+     switch kingpin.MustParse(app.Parse(os.Args[1:])) {
++    case reencrypt.FullCommand():
++        return runReencrypt(*reencryptNamespace)
+     }
+ }
+```
 
 **Flags**:  
 - `--namespace`: Target namespace (default: all).  
