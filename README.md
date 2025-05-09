@@ -1,61 +1,54 @@
-# Automated Re-Encryption of SealedSecrets
 
-_A Secure and Scalable Implementation Plan_
+# Automated Re-Encryption of SealedSecrets  
+*A Secure and Scalable Implementation Plan*
+
+---
+
+
+
+## 📖 Table of Contents  
+- [Introduction](#introduction)  
+- [Architecture](#architecture)  
+- [Component Deep Dive](#component-deep-dive)  
+- [Security & Scalability](#security-and-scalability)  
+- [Usage & Examples](#usage-and-examples)  
+- [Challenges & Mitigations](#challenges-and-mitigations)  
 
 ---
 
-## 📖 Table of Contents
-
-- [Introduction](#introduction)
-- [Architecture](#architecture)
-- [Component Deep Dive](#component-deep-dive)
-- [Security & Scalability](#security-and-scalability)
-- [Usage & Examples](#usage-and-examples)
-- [Challenges & Mitigations](#challenges-and-mitigations)
-
----
 
 <a id="introduction"></a>
-
 ## Introduction
+Bitnami's SealedSecrets enables secure secret management in Kubernetes via asymmetric encryption. However, **key rotation** creates operational overhead: older SealedSecrets remain encrypted with deprecated keys unless manually re-encrypted. This proposal automates the re-encryption process by extending the `kubeseal` CLI with a `reencrypt` command.  
 
-Bitnami's SealedSecrets enables secure secret management in Kubernetes via asymmetric encryption. However, **key rotation** creates operational overhead: older SealedSecrets remain encrypted with deprecated keys unless manually re-encrypted. This proposal automates the re-encryption process by extending the `kubeseal` CLI with a `reencrypt` command.
-
-### Goals
-
-- _Zero Manual Effort_: Bulk-reencrypt all SealedSecrets in a cluster or namespace.
-- _Security-First_: Never expose decrypted secrets or private keys.
-- _Scalability_: Handle clusters with thousands of secrets efficiently.
-- _GitOps-Friendly_: Integrate seamlessly with CI/CD pipelines.
+### Goals  
+- *Zero Manual Effort*: Bulk-reencrypt all SealedSecrets in a cluster or namespace.  
+- *Security-First*: Never expose decrypted secrets or private keys.  
+- *Scalability*: Handle clusters with thousands of secrets efficiently.  
+- *GitOps-Friendly*: Integrate seamlessly with CI/CD pipelines.  
 
 ---
 
 <a id="architecture"></a>
-
 ## Architecture
-
 The feature extends the `kubeseal` CLI and interacts with Kubernetes APIs.
 
-### High-Level Workflow
-
-1. _Discover_: List all SealedSecrets in the cluster.
-2. _Decrypt_: Use historical private keys to unlock secrets.
-3. _Re-encrypt_: Seal secrets with the latest public key.
-4. _Update_: Apply modified SealedSecrets back to the cluster.
+### High-Level Workflow  
+1. *Discover*: List all SealedSecrets in the cluster.  
+2. *Decrypt*: Use historical private keys to unlock secrets.  
+3. *Re-encrypt*: Seal secrets with the latest public key.  
+4. *Update*: Apply modified SealedSecrets back to the cluster.  
 
 ---
 
 <a id="component-deep-dive"></a>
-
 ## Component Deep Dive
 
-### 1. ClusterScanner
-
-**Objective**: Fetch all SealedSecret resources.
+### 1. ClusterScanner  
+**Objective**: Fetch all SealedSecret resources.  
 
 **Implementation**:
-
-```go
+```diff
 // Input: Kubernetes client, namespace (string)
 // Output: List of SealedSecret objects ([]v1beta1.SealedSecret)
 func ListSealedSecrets(client client.Client, namespace string) ([]v1beta1.SealedSecret, error) {
@@ -65,7 +58,6 @@ func ListSealedSecrets(client client.Client, namespace string) ([]v1beta1.Sealed
     return sealedSecrets.Items, err
 }
 ```
-
 **Reuse**: Leverages the client-go library already used by kubeseal.
 
 ---
@@ -75,8 +67,7 @@ func ListSealedSecrets(client client.Client, namespace string) ([]v1beta1.Sealed
 **Objective**: Identify decryption keys and fetch the latest public key.
 
 **Implementation**:
-
-```go
+```diff
 // Input: Controller's key Secret (v1.Secret)
 // Output: Map of private keys (map[string]*rsa.PrivateKey), latest public key (*rsa.PublicKey)
 func LoadKeys(keySecret *v1.Secret) (map[string]*rsa.PrivateKey, *rsa.PublicKey, error) {
@@ -85,7 +76,6 @@ func LoadKeys(keySecret *v1.Secret) (map[string]*rsa.PrivateKey, *rsa.PublicKey,
     return privateKeys, latestPubKey, nil
 }
 ```
-
 **Reuse**: Adapts key parsing logic from the controller's [main.go](https://github.com/bitnami-labs/sealed-secrets/blob/main/cmd/controller/main.go).
 
 ---
@@ -95,8 +85,7 @@ func LoadKeys(keySecret *v1.Secret) (map[string]*rsa.PrivateKey, *rsa.PublicKey,
 **Objective**: Decrypt a SealedSecret using its original private key.
 
 **Implementation**:
-
-```go
+```diff
 // Input: SealedSecret (v1beta1.SealedSecret), private key (*rsa.PrivateKey)
 // Output: Decrypted Kubernetes Secret (*v1.Secret), error
 func DecryptSealedSecret(ss v1beta1.SealedSecret, privateKey *rsa.PrivateKey) (*v1.Secret, error) {
@@ -104,7 +93,6 @@ func DecryptSealedSecret(ss v1beta1.SealedSecret, privateKey *rsa.PrivateKey) (*
     return decryptedSecret, nil
 }
 ```
-
 **Reuse**: Ports decryption logic from [crypto.go](https://github.com/bitnami-labs/sealed-secrets/blob/main/pkg/crypto/crypto.go).
 
 ---
@@ -114,8 +102,7 @@ func DecryptSealedSecret(ss v1beta1.SealedSecret, privateKey *rsa.PrivateKey) (*
 **Objective**: Re-encrypt secrets using the latest public key.
 
 **Implementation**:
-
-```go
+```diff
 // Input: Secret (v1.Secret), public key (*rsa.PublicKey)
 // Output: Re-encrypted SealedSecret (*v1beta1.SealedSecret), error
 func ReEncryptSecret(secret v1.Secret, pubKey *rsa.PublicKey) (*v1beta1.SealedSecret, error) {
@@ -123,7 +110,6 @@ func ReEncryptSecret(secret v1.Secret, pubKey *rsa.PublicKey) (*v1beta1.SealedSe
     return sealedSecret, nil
 }
 ```
-
 **Reuse**: Directly calls kubeseal’s Seal function from [client.go](https://github.com/bitnami-labs/sealed-secrets/blob/main/cmd/kubeseal/client.go).
 
 ---
@@ -133,15 +119,13 @@ func ReEncryptSecret(secret v1.Secret, pubKey *rsa.PublicKey) (*v1beta1.SealedSe
 **Objective**: Apply re-encrypted SealedSecrets to the cluster.
 
 **Implementation**:
-
-```go
+```diff
 // Input: Kubernetes client, updated SealedSecret (*v1beta1.SealedSecret)
 // Output: error
 func UpdateSealedSecret(client client.Client, updated *v1beta1.SealedSecret) error {
     return client.Update(context.Background(), updated)
 }
 ```
-
 **Optimization**: Uses server-side apply (`kubectl apply --server-side`) to avoid conflicts.
 
 ---
@@ -149,8 +133,7 @@ func UpdateSealedSecret(client client.Client, updated *v1beta1.SealedSecret) err
 ### 6. Orchestrator (`runReencrypt`)
 
 **Workflow**:
-
-```go
+```diff
 func runReencrypt(namespace string) error {
     // 1. Fetch all SealedSecrets
     secrets, _ := ListSealedSecrets(kubeClient, namespace)
@@ -171,13 +154,11 @@ func runReencrypt(namespace string) error {
 ---
 
 <a id="security-and-scalability"></a>
-
 ## Security & Scalability
 
 ### Security
 
 **RBAC Requirements**:
-
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -190,19 +171,17 @@ rules:
     resourceNames: ["sealed-secrets-key"]
     verbs: ["get"]
 ```
-
-_Key Handling_: Private keys are loaded into memory temporarily and never logged.
+*Key Handling*: Private keys are loaded into memory temporarily and never logged.
 
 ### Scalability
 
-- _Concurrency_: Process secrets in parallel with a worker pool (default: 10 goroutines).
-- _Batching_: Use pagination (continue tokens) for clusters with 1k+ secrets.
-- _Resumability_: Support `--resume-from=<name>` to continue interrupted jobs.
+- *Concurrency*: Process secrets in parallel with a worker pool (default: 10 goroutines).
+- *Batching*: Use pagination (continue tokens) for clusters with 1k+ secrets.
+- *Resumability*: Support `--resume-from=<name>` to continue interrupted jobs.
 
 ---
 
 <a id="usage-and-examples"></a>
-
 ## Usage & Examples
 
 ### Prerequisites
@@ -211,7 +190,6 @@ _Key Handling_: Private keys are loaded into memory temporarily and never logged
 - RBAC permissions granted (see above)
 
 ### Command
-
 ```bash
 kubeseal reencrypt   --all-namespaces   --dry-run   --log-file=report.json
 ```
@@ -219,13 +197,12 @@ kubeseal reencrypt   --all-namespaces   --dry-run   --log-file=report.json
 ### Flags
 
 | Flag          | Purpose                         |
-| ------------- | ------------------------------- |
+|---------------|----------------------------------|
 | `--namespace` | Target a specific namespace     |
 | `--dry-run`   | Validate without making changes |
 | `--limit=20`  | Control parallel operations     |
 
 ### Output
-
 ```
 2023-10-01 12:00:00 | Re-encrypting 142 SealedSecrets...
 2023-10-01 12:00:05 | Success: 140 | Failed: 2
@@ -237,15 +214,14 @@ Report saved to report.json.
 ---
 
 <a id="challenges-and-mitigations"></a>
-
 ## Challenges & Mitigations
 
 | Challenge              | Mitigation                                                      |
-| ---------------------- | --------------------------------------------------------------- |
-| _Private Key Exposure_ | Restrict RBAC to read-only for the key Secret.                  |
-| _Partial Failures_     | Atomic updates per secret; failed secrets are logged & retried. |
-| _Large Clusters_       | Use pagination and limit concurrency to avoid API throttling.   |
-| _Legacy Key Formats_   | Skip secrets encrypted with unsupported keys; log warnings.     |
+|------------------------|-----------------------------------------------------------------|
+| *Private Key Exposure* | Restrict RBAC to read-only for the key Secret.                  |
+| *Partial Failures*     | Atomic updates per secret; failed secrets are logged & retried. |
+| *Large Clusters*       | Use pagination and limit concurrency to avoid API throttling.   |
+| *Legacy Key Formats*   | Skip secrets encrypted with unsupported keys; log warnings.     |
 
 ---
 
@@ -254,11 +230,10 @@ Report saved to report.json.
 This implementation provides a secure, automated solution for SealedSecret re-encryption, addressing a critical operational gap in key rotation. By building on proven components and emphasizing scalability, it aligns with modern GitOps workflows while maintaining the security guarantees of sealed-secrets.
 
 **Future Work**:
-
 - Integration with Kubernetes CronJobs for scheduled re-encryption
 - Prometheus metrics for monitoring
 
 ---
 
 > “Security is a process, not a product.”  
-> — _Bruce Schneier_
+> — *Bruce Schneier*
