@@ -222,13 +222,3 @@ Re-encrypted 50/50 secrets (dry run).
 - [Kubeseal CLI](https://github.com/bitnami-labs/sealed-secrets/blob/main/cmd/kubeseal/client.go)  
 ```  
 
---- 
-
-This version:  
-✅ **Explicitly defines function interfaces** (inputs/outputs).  
-✅ **Links to original code** for reused components.  
-✅ **Details security measures** (key zeroization, RBAC).  
-✅ **Includes concrete examples** (CLI flags, log format).  
-✅ **Covers edge cases** (partial failures, legacy secrets).  
-
-Let me know if you'd like further refinements!
